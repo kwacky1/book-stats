@@ -5,11 +5,11 @@ A lightweight script that scrapes your public [StoryGraph](https://app.thestoryg
 ## Output example
 
 ```
-📖 Currently reading: *The Left Hand of Darkness*
-⏳ Progress: 42%
-🏁 Last finished: *Piranesi* (15 Feb 2026)
-📅 Books this year: 8
-🎯 Goal: 8 / 30 (27%)
+📖 Currently reading: *World War 3.3* by John Birmingham
+📚 Also reading: *The Colour of Magic* by Terry Pratchett
+🏁 Last finished: *Transformers: Last Stand of the Wreckers*
+📅 Books this year: 6
+📊 Total: 11 books · 3,085 pages
 ```
 
 ## Requirements

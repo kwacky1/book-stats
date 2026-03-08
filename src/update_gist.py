@@ -18,11 +18,14 @@ GIST_ID = os.environ.get("GIST_ID", "")
 GITHUB_TOKEN = os.environ.get("GH_TOKEN", "")
 GIST_FILENAME = os.environ.get("GIST_FILENAME", "reading-stats.md")
 
-PROFILE_URL = "https://app.thestorygraph.com/profile/{user}"
-STATS_URL = "https://app.thestorygraph.com/stats/{user}"
-GOALS_URL = "https://app.thestorygraph.com/reading_goals/{user}"
+BASE = "https://app.thestorygraph.com"
+PROFILE_URL = BASE + "/profile/{user}"
+CURRENTLY_READING_URL = BASE + "/currently-reading/{user}"
+BOOKS_READ_URL = BASE + "/books-read/{user}"
+STATS_URL = BASE + "/stats/{user}"
 
 PAGE_TIMEOUT_MS = 30_000
+SETTLE_MS = 5_000
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +41,10 @@ def _get_browser():
     global _browser, _playwright
     if _browser is None:
         _playwright = sync_playwright().start()
-        _browser = _playwright.chromium.launch(headless=True)
+        _browser = _playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
     return _browser
 
 
@@ -56,11 +62,21 @@ def close_browser() -> None:
 def fetch_page(url: str) -> BeautifulSoup:
     """Navigate to *url* in headless Chromium and return a BeautifulSoup tree."""
     browser = _get_browser()
-    page = browser.new_page()
+    ctx = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 720},
+    )
+    page = ctx.new_page()
+    page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-        # Give JS-rendered content a moment to settle
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(SETTLE_MS)
         html = page.content()
     except PlaywrightTimeout:
         print(f"Timeout loading {url}", file=sys.stderr)
@@ -69,8 +85,18 @@ def fetch_page(url: str) -> BeautifulSoup:
         print(f"Error fetching {url}: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
-        page.close()
-    return BeautifulSoup(html, "html.parser")
+        ctx.close()
+
+    soup = BeautifulSoup(html, "html.parser")
+    page_title = soup.title.string if soup.title else ""
+    if "Sign In" in page_title or "sign_in" in page.url:
+        print(
+            f"StoryGraph redirected to sign-in for {url}. "
+            "Ensure the profile is set to Public in StoryGraph settings.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return soup
 
 
 # ---------------------------------------------------------------------------
@@ -82,114 +108,70 @@ def clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def parse_currently_reading(soup: BeautifulSoup) -> tuple[str, str, str]:
-    """Extract (title, author, progress) from the currently-reading section.
-
-    Returns placeholder strings when the section is missing.
-    """
-    section = (
-        soup.select_one(".currently-reading")
-        or soup.select_one("[data-controller='currently-reading']")
-        or soup.find(id=re.compile(r"currently.reading", re.I))
-    )
-    if not section:
-        return ("—", "—", "0%")
-
-    # Title: first .book-title-author-and-series or first <a> with /books/
-    title_el = (
-        section.select_one(".book-title-author-and-series h3")
-        or section.select_one(".book-title")
-        or section.select_one("a[href*='/books/']")
-    )
-    title = clean(title_el.get_text()) if title_el else "—"
-
-    # Author
-    author_el = (
-        section.select_one(".book-title-author-and-series p")
-        or section.select_one(".authors-info")
-        or section.select_one(".author-name")
-    )
-    author = clean(author_el.get_text()).removeprefix("by ") if author_el else "—"
-
-    # Progress: look for a percentage string like "42%"
-    progress = "0%"
-    progress_el = section.select_one(".progress") or section.select_one("[style*=width]")
-    if progress_el:
-        pct_match = re.search(r"(\d+)\s*%", progress_el.get_text() + str(progress_el.get("style", "")))
-        if pct_match:
-            progress = f"{pct_match.group(1)}%"
-    else:
-        pct_match = re.search(r"(\d+)\s*%", section.get_text())
-        if pct_match:
-            progress = f"{pct_match.group(1)}%"
-
-    return (title, author, progress)
+def parse_book_pane(pane) -> dict:
+    """Extract title and author from a .book-pane element."""
+    info = {"title": "—", "author": "—"}
+    ts = pane.select_one(".book-title-author-and-series")
+    if not ts:
+        return info
+    title_link = ts.select_one("a[href*='/books/']")
+    if title_link:
+        info["title"] = clean(title_link.get_text())
+    author_link = ts.select_one("a[href*='/authors/']")
+    if author_link:
+        info["author"] = clean(author_link.get_text())
+    return info
 
 
-def parse_last_finished(soup: BeautifulSoup) -> tuple[str, str]:
-    """Extract (title, date) of the most recently finished book.
-
-    Falls back gracefully when the section is not present.
-    """
-    section = (
-        soup.select_one(".books-pane-list")
-        or soup.select_one(".read-books")
-        or soup.find("div", class_=re.compile(r"book.pane", re.I))
-    )
-    if not section:
-        return ("—", "—")
-
-    book = section.select_one(".book-pane") or section.select_one("[class*='book-pane']")
-    if not book:
-        return ("—", "—")
-
-    title_el = (
-        book.select_one(".book-title-author-and-series h3")
-        or book.select_one(".book-title")
-        or book.select_one("a[href*='/books/']")
-    )
-    title = clean(title_el.get_text()) if title_el else "—"
-
-    date_el = book.select_one(".date-read") or book.select_one("span[class*='date']")
-    date_str = clean(date_el.get_text()) if date_el else "—"
-
-    return (title, date_str)
+def parse_currently_reading(soup: BeautifulSoup) -> list[dict]:
+    """Return a list of currently-reading books [{title, author}, ...]."""
+    books = []
+    for pane in soup.select(".book-pane"):
+        books.append(parse_book_pane(pane))
+    return books
 
 
-def parse_yearly_stats(soup: BeautifulSoup) -> tuple[str, str]:
-    """Extract (books_read, pages_read) from the stats page."""
-    section = (
-        soup.select_one(".stats-section")
-        or soup.select_one("[class*='stats']")
-        or soup.find("div", class_=re.compile(r"stat", re.I))
-    )
-    text = section.get_text(" ", strip=True) if section else soup.get_text(" ", strip=True)
-
-    books_match = re.search(r"(\d+)\s*books?\s*read", text, re.I)
-    pages_match = re.search(r"([\d,]+)\s*pages?\s*read", text, re.I)
-
-    books = books_match.group(1) if books_match else "0"
-    pages = pages_match.group(1) if pages_match else "0"
-    return (books, pages)
+def parse_last_finished(soup: BeautifulSoup) -> dict:
+    """Return {title, author} for the most recently finished book."""
+    pane = soup.select_one(".book-pane")
+    if pane:
+        return parse_book_pane(pane)
+    return {"title": "—", "author": "—"}
 
 
-def parse_goal(soup: BeautifulSoup) -> tuple[str, str, str]:
-    """Extract (current, target, percentage) for the yearly reading goal."""
-    section = (
-        soup.select_one(".reading-goal")
-        or soup.select_one("[class*='goal']")
-        or soup.find("div", class_=re.compile(r"goal", re.I))
-    )
-    text = section.get_text(" ", strip=True) if section else soup.get_text(" ", strip=True)
+def parse_profile_counts(soup: BeautifulSoup) -> dict:
+    """Extract 'N Books' and 'N This Year' from the profile header."""
+    result = {"total_books": "0", "books_this_year": "0"}
+    text = soup.get_text(" ", strip=True)
 
-    # Patterns like "8 / 30", "8 of 30", "8/30"
-    goal_match = re.search(r"(\d+)\s*[/of]+\s*(\d+)", text, re.I)
-    if goal_match:
-        current, target = goal_match.group(1), goal_match.group(2)
-        pct = round(int(current) / int(target) * 100) if int(target) else 0
-        return (current, target, f"{pct}%")
+    total = re.search(r"(\d+)\s+Books?\b", text)
+    if total:
+        result["total_books"] = total.group(1)
 
-    return ("0", "0", "0%")
+    this_year = re.search(r"(\d+)\s+This\s+Year", text)
+    if this_year:
+        result["books_this_year"] = this_year.group(1)
+
+    return result
+
+
+def parse_stats(soup: BeautifulSoup) -> dict:
+    """Extract books, pages, and hours from the stats page summary line."""
+    result = {"books": "0", "pages": "0", "hours": "0"}
+    text = soup.get_text(" ", strip=True)
+
+    # Matches "11 books , 3,085 pages, 13.5 hours" or similar
+    books = re.search(r"(\d+)\s*books?\b", text, re.I)
+    pages = re.search(r"([\d,]+)\s*pages?\b", text, re.I)
+    hours = re.search(r"([\d,.]+)\s*hours?\b", text, re.I)
+
+    if books:
+        result["books"] = books.group(1)
+    if pages:
+        result["pages"] = pages.group(1)
+    if hours:
+        result["hours"] = hours.group(1)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -197,22 +179,27 @@ def parse_goal(soup: BeautifulSoup) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 def build_markdown(
-    title: str,
-    progress: str,
-    last_title: str,
-    last_date: str,
-    books_read: str,
-    goal_current: str,
-    goal_target: str,
-    goal_pct: str,
+    currently_reading: list[dict],
+    last_finished: dict,
+    books_this_year: str,
+    total_books: str,
+    pages: str,
 ) -> str:
     """Return the 5-line Markdown summary."""
+    cr = currently_reading[0] if currently_reading else {"title": "—", "author": "—"}
+    cr2_line = ""
+    if len(currently_reading) > 1:
+        cr2 = currently_reading[1]
+        cr2_line = f"\U0001F4DA Also reading: *{cr2['title']}* by {cr2['author']}"
+    else:
+        cr2_line = "\U0001F4DA Also reading: —"
+
     lines = [
-        f"\U0001F4D6 Currently reading: *{title}*",
-        f"\u23F3 Progress: {progress}",
-        f"\U0001F3C1 Last finished: *{last_title}* ({last_date})",
-        f"\U0001F4C5 Books this year: {books_read}",
-        f"\U0001F3AF Goal: {goal_current} / {goal_target} ({goal_pct})",
+        f"\U0001F4D6 Currently reading: *{cr['title']}* by {cr['author']}",
+        cr2_line,
+        f"\U0001F3C1 Last finished: *{last_finished['title']}*",
+        f"\U0001F4C5 Books this year: {books_this_year}",
+        f"\U0001F4CA Total: {total_books} books \u00b7 {pages} pages",
     ]
     return "\n".join(lines) + "\n"
 
@@ -252,31 +239,35 @@ def main() -> None:
         print("Set STORYGRAPH_USERNAME environment variable.", file=sys.stderr)
         sys.exit(1)
 
+    user = STORYGRAPH_USER
+
     try:
-        profile_soup = fetch_page(PROFILE_URL.format(user=STORYGRAPH_USER))
-        stats_soup = fetch_page(STATS_URL.format(user=STORYGRAPH_USER))
-        goals_soup = fetch_page(GOALS_URL.format(user=STORYGRAPH_USER))
+        profile_soup = fetch_page(PROFILE_URL.format(user=user))
+        cr_soup = fetch_page(CURRENTLY_READING_URL.format(user=user))
+        read_soup = fetch_page(BOOKS_READ_URL.format(user=user))
+        stats_soup = fetch_page(STATS_URL.format(user=user))
     finally:
         close_browser()
 
-    title, _author, progress = parse_currently_reading(profile_soup)
-    last_title, last_date = parse_last_finished(profile_soup)
-    books_read, _pages_read = parse_yearly_stats(stats_soup)
-    goal_current, goal_target, goal_pct = parse_goal(goals_soup)
+    currently_reading = parse_currently_reading(cr_soup)
+    last_finished = parse_last_finished(read_soup)
+    counts = parse_profile_counts(profile_soup)
+    stats = parse_stats(stats_soup)
 
     markdown = build_markdown(
-        title=title,
-        progress=progress,
-        last_title=last_title,
-        last_date=last_date,
-        books_read=books_read,
-        goal_current=goal_current,
-        goal_target=goal_target,
-        goal_pct=goal_pct,
+        currently_reading=currently_reading,
+        last_finished=last_finished,
+        books_this_year=counts["books_this_year"],
+        total_books=counts["total_books"],
+        pages=stats["pages"],
     )
 
     print(markdown)
     update_gist(markdown)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
