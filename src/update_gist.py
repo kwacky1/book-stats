@@ -3,11 +3,11 @@
 
 import os
 import sys
-import json
 import re
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -22,25 +22,55 @@ PROFILE_URL = "https://app.thestorygraph.com/profile/{user}"
 STATS_URL = "https://app.thestorygraph.com/stats/{user}"
 GOALS_URL = "https://app.thestorygraph.com/reading_goals/{user}"
 
-HEADERS = {
-    "User-Agent": "book-stats/1.0 (https://github.com)",
-    "Accept": "text/html",
-}
+PAGE_TIMEOUT_MS = 30_000
 
 
 # ---------------------------------------------------------------------------
-# Fetching
+# Fetching (Playwright — bypasses Cloudflare JS challenge)
 # ---------------------------------------------------------------------------
+
+_browser = None
+_playwright = None
+
+
+def _get_browser():
+    """Lazily launch a shared headless Chromium instance."""
+    global _browser, _playwright
+    if _browser is None:
+        _playwright = sync_playwright().start()
+        _browser = _playwright.chromium.launch(headless=True)
+    return _browser
+
+
+def close_browser() -> None:
+    """Shut down the shared browser if it was started."""
+    global _browser, _playwright
+    if _browser:
+        _browser.close()
+        _browser = None
+    if _playwright:
+        _playwright.stop()
+        _playwright = None
+
 
 def fetch_page(url: str) -> BeautifulSoup:
-    """Return a BeautifulSoup tree for *url*, or exit on failure."""
+    """Navigate to *url* in headless Chromium and return a BeautifulSoup tree."""
+    browser = _get_browser()
+    page = browser.new_page()
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
+        page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        # Give JS-rendered content a moment to settle
+        page.wait_for_timeout(3000)
+        html = page.content()
+    except PlaywrightTimeout:
+        print(f"Timeout loading {url}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
         print(f"Error fetching {url}: {exc}", file=sys.stderr)
         sys.exit(1)
-    return BeautifulSoup(resp.text, "html.parser")
+    finally:
+        page.close()
+    return BeautifulSoup(html, "html.parser")
 
 
 # ---------------------------------------------------------------------------
@@ -222,9 +252,12 @@ def main() -> None:
         print("Set STORYGRAPH_USERNAME environment variable.", file=sys.stderr)
         sys.exit(1)
 
-    profile_soup = fetch_page(PROFILE_URL.format(user=STORYGRAPH_USER))
-    stats_soup = fetch_page(STATS_URL.format(user=STORYGRAPH_USER))
-    goals_soup = fetch_page(GOALS_URL.format(user=STORYGRAPH_USER))
+    try:
+        profile_soup = fetch_page(PROFILE_URL.format(user=STORYGRAPH_USER))
+        stats_soup = fetch_page(STATS_URL.format(user=STORYGRAPH_USER))
+        goals_soup = fetch_page(GOALS_URL.format(user=STORYGRAPH_USER))
+    finally:
+        close_browser()
 
     title, _author, progress = parse_currently_reading(profile_soup)
     last_title, last_date = parse_last_finished(profile_soup)

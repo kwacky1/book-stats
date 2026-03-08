@@ -27,6 +27,7 @@ A lightweight script that scrapes your public [StoryGraph](https://app.thestoryg
 git clone https://github.com/<you>/book-stats.git
 cd book-stats
 pip install -r requirements.txt
+playwright install chromium
 ```
 
 ### 2. Create a GitHub Gist
@@ -74,10 +75,11 @@ The included workflow runs once per day at 06:00 UTC.
 
 ## How it works
 
-1. Fetches your public StoryGraph profile, stats, and goals pages.
-2. Parses the HTML with BeautifulSoup using predictable CSS selectors (`.currently-reading`, `.book-pane`, `.stats-section`, etc.).
-3. Builds a 5-line Markdown snippet.
-4. PATCHes the Gist via the GitHub API.
+1. Launches headless Chromium via Playwright to bypass Cloudflare's bot protection.
+2. Fetches your public StoryGraph profile, stats, and goals pages.
+3. Parses the HTML with BeautifulSoup using predictable CSS selectors (`.currently-reading`, `.book-pane`, `.stats-section`, etc.).
+4. Builds a 5-line Markdown snippet.
+5. PATCHes the Gist via the GitHub API.
 
 ## Resilience
 
